@@ -1,0 +1,175 @@
+name: Sync Fork # with Upstream (Preserve Local Changes)
+
+# 触发条件配置
+on:
+  schedule:
+    # 定时任务：每天 UTC 时间 0:00 运行（北京时间 8:00）
+    # 可以修改 cron 表达式调整同步频率
+    - cron: '0 0 * * *'
+  workflow_dispatch:  # 允许在 GitHub Actions 界面手动触发运行
+
+# GITHUB_TOKEN 权限
+# 注意：GITHUB_TOKEN 不支持 workflows 权限，无法推送 .github/workflows/ 文件
+# 解决方案：rebase 后、push 前删除上游引入的 workflow 文件（fork 不需要上游的 Actions）
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest  # 使用最新的 Ubuntu 运行环境
+
+    steps:
+      # ============================================================
+      # 步骤1：检出你的 fork 仓库代码
+      # ============================================================
+      - name: Checkout fork repository
+        uses: actions/checkout@v6  # 使用官方 checkout action
+        with:
+          fetch-depth: 0           # 拉取完整提交历史（rebase 需要完整历史）
+          token: ${{ secrets.GITHUB_TOKEN }}  # 使用 GitHub 自动生成的 token 进行认证
+
+      # ============================================================
+      # 步骤2：配置 Git 用户信息
+      # ============================================================
+      - name: Configure Git
+        run: |
+          # 设置 Git 用户名，用于后续的提交操作
+          git config user.name "github-actions[bot]"
+          # 设置 Git 用户邮箱
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # 设置 rebase 时自动暂存未提交的修改（防止丢失）
+          git config rebase.autoStash true
+
+      # ============================================================
+      # 步骤3：使用 Rebase 策略同步上游更新（保留你的本地修改）
+      # ============================================================
+      - name: Sync with upstream using rebase
+        env:
+          # ⚠️ 请修改为实际的上游仓库（原始项目）
+          UPSTREAM_REPO: "Openwrt-Passwall/openwrt-passwall-packages"
+          # ⚠️ 请修改为你的目标分支（通常是 main 或 master）
+          TARGET_BRANCH: "main"
+        run: |
+          # ----------------------------------------
+          # 3.1 显示当前分支信息（用于调试）
+          # ----------------------------------------
+          echo "🔍 当前分支信息："
+          git branch -a
+
+          # ----------------------------------------
+          # 3.2 添加上游仓库为远程仓库
+          # ----------------------------------------
+          echo "📦 添加上游仓库：https://github.com/${{ env.UPSTREAM_REPO }}.git"
+          # 添加名为 upstream 的远程仓库（只读方式，无法推送）
+          git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git
+
+          # ----------------------------------------
+          # 3.3 从上游仓库拉取最新代码
+          # ----------------------------------------
+          echo "🔄 获取上游仓库最新代码..."
+          # fetch 只拉取代码，不会合并或修改当前分支
+          git fetch upstream
+
+          # ----------------------------------------
+          # 3.4 切换到目标分支（你的主分支）
+          # ----------------------------------------
+          echo "🔀 切换到目标分支：${{ env.TARGET_BRANCH }}"
+          git checkout ${{ env.TARGET_BRANCH }}
+
+          # ----------------------------------------
+          # 3.5 检查是否需要同步
+          # ----------------------------------------
+          echo "📊 检查同步状态..."
+          # 计算当前分支落后于上游多少个提交
+          BEHIND_COUNT=$(git rev-list --count HEAD..upstream/${{ env.TARGET_BRANCH }})
+          # 计算当前分支领先于上游多少个提交（你自己的修改）
+          AHEAD_COUNT=$(git rev-list --count upstream/${{ env.TARGET_BRANCH }}..HEAD)
+
+          # 如果没有任何落后，说明已经是最新，直接退出
+          if [ $BEHIND_COUNT -eq 0 ]; then
+            echo "✅ 分支已经是最新，无需同步"
+            exit 0
+          fi
+
+          # 显示同步状态
+          echo "📝 你的分支领先 $AHEAD_COUNT 个提交（你的本地修改）"
+          echo "📝 你的分支落后 $BEHIND_COUNT 个提交（上游的新提交）"
+
+          # ----------------------------------------
+          # 3.6 执行 rebase 操作（核心步骤）
+          # ----------------------------------------
+          echo "🔄 执行 rebase（保留你的修改，将你的提交应用到上游最新代码之上）..."
+
+          # 尝试执行 rebase
+          # 效果：把你的本地提交重新应用到上游最新提交之上
+          # 类似于：你的修改 + 上游新代码 = 最终代码
+          if git rebase upstream/${{ env.TARGET_BRANCH }}; then
+            echo "✅ Rebase 成功完成，你的修改已应用到最新代码之上"
+          else
+            # ----------------------------------------
+            # 3.7 处理 rebase 冲突（自动优先保留你的修改）
+            # ----------------------------------------
+            echo "⚠️  Rebase 过程中出现冲突"
+            echo "冲突文件列表："
+            # 显示所有冲突文件
+            git diff --name-only --diff-filter=U
+
+            echo "🛠️  正在尝试自动解决冲突（优先保留你的修改）..."
+            # ★ 修复：rebase 中 --theirs 才是你的修改，--ours 是上游代码 ★
+            # rebase 的方向与 merge 相反：
+            #   rebase --ours  = 基底分支（upstream），即上游版本
+            #   rebase --theirs = 正在被 rebase 的提交，即你的修改
+            # 原脚本用 --ours 会错误地保留上游版本，丢失你的修改
+            git diff --name-only --diff-filter=U | xargs -I {} git checkout --theirs {}
+            # 将解决后的文件添加到暂存区
+            git add .
+            # 继续 rebase 过程
+            git rebase --continue
+
+            echo "✅ 已优先使用你的修改解决冲突"
+          fi
+
+          # ----------------------------------------
+          # 3.7.5 清理上游引入的 workflow 文件
+          # ----------------------------------------
+          # GITHUB_TOKEN 无法推送 .github/workflows/ 下的文件
+          # fork 不需要上游的 Actions，删除它们避免推送被拒绝
+          echo "🧹 清理上游引入的 workflow 文件..."
+          if [ -d .github/workflows ]; then
+            for f in .github/workflows/*.yml .github/workflows/*.yaml; do
+              [ -f "$f" ] || continue
+              # 跳过本文件（Sync Fork.yml），保留自己的同步 workflow
+              [ "$(basename "$f")" = "Sync Fork.yml" ] && continue
+              git rm "$f"
+              echo "  删除: $f"
+            done
+            # 如果有文件被删除，提交这个变更
+            git diff --cached --quiet || git commit -m "chore: remove upstream workflow files"
+          fi
+
+          # ----------------------------------------
+          # 3.8 推送同步后的代码到你的 fork
+          # ----------------------------------------
+          echo "📤 推送同步后的代码到你的远程仓库..."
+          # --force-with-lease 比 --force 更安全
+          # 如果远程分支在推送前被他人更新，会拒绝推送防止覆盖他人工作
+          if git push origin ${{ env.TARGET_BRANCH }} --force-with-lease; then
+            echo "🎉 同步完成！你的本地修改已保留并应用到最新代码之上"
+          else
+            echo "❌ 推送失败，可能需要手动处理"
+            exit 1
+          fi
+
+      # ============================================================
+      # 步骤4：显示同步结果（可选，仅用于查看）
+      # ============================================================
+      - name: Show sync result
+        if: always()  # 无论前面的步骤成功或失败，都执行此步骤
+        run: |
+          echo "📋 同步结果摘要："
+          echo "当前分支：$(git branch --show-current)"
+          echo "最新提交信息："
+          git log -1 --oneline
+          echo ""
+          echo "📊 最近5次提交历史："
+          git log --oneline -5
